@@ -30,8 +30,11 @@ def mail_configured() -> bool:
 
 def send_email(to_addr: str, subject: str, text_body: str, html_body: str | None = None) -> bool:
     """Send one email via Gmail SMTP. Returns True on success, False otherwise."""
+    print(f"[mailer] send_email() called → to={to_addr!r} "
+          f"user_set={bool(GMAIL_USER)} pass_set={bool(GMAIL_APP_PASSWORD)} "
+          f"pass_len={len(GMAIL_APP_PASSWORD)}", flush=True)
     if not mail_configured():
-        print("[mailer] GMAIL_USER / GMAIL_APP_PASSWORD not set — skipping send.")
+        print("[mailer] GMAIL_USER / GMAIL_APP_PASSWORD not set — skipping send.", flush=True)
         return False
 
     msg = EmailMessage()
@@ -48,7 +51,8 @@ def send_email(to_addr: str, subject: str, text_body: str, html_body: str | None
         with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=20) as server:
             server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
             server.send_message(msg)
+        print(f"[mailer] SENT OK → {to_addr}", flush=True)
         return True
     except Exception as e:
-        print(f"[mailer] send failed: {e}")
+        print(f"[mailer] send FAILED: {type(e).__name__}: {e}", flush=True)
         return False
