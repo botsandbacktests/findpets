@@ -12,12 +12,14 @@ from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
-from .config import (UPLOAD_DIR, DEFAULT_ALERT_THRESHOLD, SQUARE_PAYMENT_LINK,
+from .config import (UPLOAD_DIR, DEFAULT_ALERT_THRESHOLD, SQUARE_PAYMENT_LINK, SITE_URL,
                      UNLOCK_PRICE_USD, UNLOCK_DAYS)
 from .db import SessionLocal, User, Pet, Sighting, ContactUnlock, init_db
 from .embedder import get_embedder
 from .matching import find_matches
-from .auth import hash_password, verify_password, make_token, read_token
+from .auth import (hash_password, verify_password, make_token, read_token,
+                   make_reset_token, read_reset_token)
+from .mailer import send_email, mail_configured
 
 WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
 
@@ -149,6 +151,61 @@ def login(email: str = Form(...), password: str = Form(...), db: Session = Depen
 @app.get("/api/auth/me")
 def me(user: User = Depends(require_user)):
     return {"id": user.id, "email": user.email, "display_name": user.display_name}
+
+
+@app.post("/api/auth/forgot")
+def forgot_password(email: str = Form(...), db: Session = Depends(get_db)):
+    """Email a password-reset link if the account exists.
+
+    Always returns the same success message whether or not the email exists,
+    so attackers can't use this to discover which emails are registered.
+    """
+    email = email.strip().lower()
+    u = db.query(User).filter(User.email == email).first()
+    if u:
+        token = make_reset_token(u.id, u.password_hash, minutes=30)
+        link = f"{SITE_URL}/reset.html?token={token}"
+        text = (
+            f"Hi,\n\nWe got a request to reset your FindMyPet password.\n\n"
+            f"Click this link to set a new password (valid for 30 minutes):\n{link}\n\n"
+            f"If you didn't request this, you can ignore this email — your "
+            f"password won't change.\n\n— FindMyPet"
+        )
+        html = (
+            f"<p>Hi,</p><p>We got a request to reset your <b>FindMyPet</b> password.</p>"
+            f"<p><a href=\"{link}\">Click here to set a new password</a> "
+            f"(valid for 30 minutes).</p>"
+            f"<p>If you didn't request this, you can ignore this email — your "
+            f"password won't change.</p><p>— FindMyPet</p>"
+        )
+        send_email(u.email, "Reset your FindMyPet password", text, html)
+    return {"ok": True,
+            "message": "If an account exists for that email, a reset link has been sent."}
+
+
+@app.post("/api/auth/reset")
+def reset_password(token: str = Form(...), new_password: str = Form(...),
+                   db: Session = Depends(get_db)):
+    """Set a new password using a valid reset token from the emailed link."""
+    if len(new_password) < 6:
+        raise HTTPException(400, "Password must be at least 6 characters.")
+    # We need the user's CURRENT hash to validate the token, but the token only
+    # carries the uid inside its signed body. Decode uid loosely first.
+    try:
+        import base64, json
+        body = token.split(".")[0]
+        pad = "=" * (-len(body) % 4)
+        uid = int(json.loads(base64.urlsafe_b64decode(body + pad))["uid"])
+    except Exception:
+        raise HTTPException(400, "This reset link is invalid or has expired.")
+    u = db.get(User, uid)
+    if not u or read_reset_token(token, u.password_hash) != u.id:
+        raise HTTPException(400, "This reset link is invalid or has expired.")
+    u.password_hash = hash_password(new_password)
+    db.commit()
+    # Log them straight in after resetting.
+    return {"ok": True, "token": make_token(u.id), "email": u.email,
+            "display_name": u.display_name}
 
 
 # ---------------------------------------------------------------- pets / sightings

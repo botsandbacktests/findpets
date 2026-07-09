@@ -31,3 +31,7 @@ UNLOCK_DAYS = 30  # a paid unlock grants contact access for this many days (per 
 
 # Secret used to sign login/session tokens. Override in production via env var.
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-insecure-change-me")
+
+# Public URL of the front-end (used to build password-reset links in emails).
+# e.g. https://tech956.com/findpets  — no trailing slash.
+SITE_URL = os.environ.get("SITE_URL", "https://tech956.com/findpets").rstrip("/")

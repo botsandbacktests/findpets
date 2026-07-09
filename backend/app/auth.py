@@ -54,3 +54,36 @@ def read_token(token: str) -> int | None:
         return int(payload["uid"])
     except Exception:
         return None
+
+
+# --- Password reset tokens ---------------------------------------------------
+# Stateless & signed (no DB row needed). We bind the token to the user's current
+# password hash, so once the password changes the token can't be reused.
+
+def make_reset_token(user_id: int, password_hash: str, minutes: int = 30) -> str:
+    """A short-lived, single-use-ish token emailed to the user."""
+    # Tie the token to a fingerprint of the current password hash. After a
+    # successful reset the hash changes, invalidating any older reset links.
+    fp = hmac.new(SECRET_KEY.encode(), password_hash.encode(), hashlib.sha256).hexdigest()[:16]
+    payload = {"uid": user_id, "typ": "reset", "fp": fp,
+               "exp": int(time.time()) + minutes * 60}
+    body = base64.urlsafe_b64encode(json.dumps(payload).encode()).decode().rstrip("=")
+    return f"{body}.{_sign(body.encode())}"
+
+
+def read_reset_token(token: str, password_hash: str) -> int | None:
+    """Return user_id if this reset token is valid for the given current hash."""
+    try:
+        body, sig = token.split(".")
+        if not hmac.compare_digest(sig, _sign(body.encode())):
+            return None
+        pad = "=" * (-len(body) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(body + pad))
+        if payload.get("typ") != "reset" or payload["exp"] < time.time():
+            return None
+        fp = hmac.new(SECRET_KEY.encode(), password_hash.encode(), hashlib.sha256).hexdigest()[:16]
+        if not hmac.compare_digest(payload.get("fp", ""), fp):
+            return None  # password already changed since this link was issued
+        return int(payload["uid"])
+    except Exception:
+        return None
