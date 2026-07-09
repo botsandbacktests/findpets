@@ -176,7 +176,9 @@ def forgot_password(email: str = Form(...), db: Session = Depends(get_db)):
             f"<p><a href=\"{link}\">Click here to set a new password</a> "
             f"(valid for 30 minutes).</p>"
             f"<p>If you didn't request this, you can ignore this email — your "
-            f"password won't change.</p><p>— FindMyPet</p>"
+            f"password won't change.</p>"
+            f"<p style=\"color:#6b7280;font-size:13px\">Tip: add us to your contacts so future "
+            f"FindMyPet alerts don't land in spam.</p><p>— FindMyPet</p>"
         )
         send_email(u.email, "Reset your FindMyPet password", text, html)
     return {"ok": True,
