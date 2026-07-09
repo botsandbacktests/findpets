@@ -5,6 +5,10 @@ pydantic==2.7.1
 python-multipart==0.0.9
 numpy==1.26.4
 Pillow==10.3.0
+# --- Postgres driver (persistent database on Render). Harmless with SQLite.
+psycopg2-binary==2.9.9
+# --- Cloudinary: persistent photo storage (photos survive redeploys).
+cloudinary==1.40.0
 # --- Needed on cPanel/Passenger (WSGI) to serve the FastAPI ASGI app.
 # --- Harmless everywhere else; keep it in.
 a2wsgi==1.10.10
