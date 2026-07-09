@@ -63,6 +63,7 @@ class Pet(Base):
     contact_phone: Mapped[str] = mapped_column(String(40), default="")
 
     photo_path: Mapped[str] = mapped_column(String(255), default="")
+    photo_path2: Mapped[str] = mapped_column(String(255), default="")  # optional 2nd photo (display only)
     embedding: Mapped[bytes] = mapped_column(LargeBinary)   # np.float32 bytes
     embed_model: Mapped[str] = mapped_column(String(60), default="")
 
@@ -87,6 +88,7 @@ class Sighting(Base):
     status: Mapped[str] = mapped_column(String(20), default="open")
 
     photo_path: Mapped[str] = mapped_column(String(255), default="")
+    photo_path2: Mapped[str] = mapped_column(String(255), default="")  # optional 2nd photo (display only)
     embedding: Mapped[bytes] = mapped_column(LargeBinary)
     embed_model: Mapped[str] = mapped_column(String(60), default="")
 
@@ -119,5 +121,46 @@ class ContactUnlock(Base):
         )
 
 
+class MatchAlert(Base):
+    """Record that we emailed an alert for a given pet+sighting match.
+
+    Used purely as a de-dup guard so an owner isn't emailed repeatedly about the
+    same sighting matching the same pet. One row per (pet_id, sighting_id).
+    """
+    __tablename__ = "match_alerts"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    pet_id: Mapped[int] = mapped_column(ForeignKey("pets.id"), index=True)
+    sighting_id: Mapped[int | None] = mapped_column(
+        ForeignKey("sightings.id"), nullable=True, index=True
+    )
+    owner_emailed: Mapped[int] = mapped_column(Integer, default=0)   # 0/1
+    finder_emailed: Mapped[int] = mapped_column(Integer, default=0)  # 0/1
+    score_pct: Mapped[float] = mapped_column(Float, default=0.0)
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+
+
+def _ensure_columns() -> None:
+    """Tiny idempotent migration: add photo_path2 to existing tables.
+
+    create_all() only creates MISSING tables — it never alters existing ones.
+    On an already-deployed DB (Render Postgres) the new photo_path2 columns
+    won't exist, so add them here if missing. Safe to run every startup.
+    """
+    from sqlalchemy import inspect, text
+    insp = inspect(engine)
+    for table in ("pets", "sightings"):
+        if table not in insp.get_table_names():
+            continue
+        cols = {c["name"] for c in insp.get_columns(table)}
+        if "photo_path2" not in cols:
+            with engine.begin() as conn:
+                conn.execute(text(
+                    f"ALTER TABLE {table} ADD COLUMN photo_path2 VARCHAR(255) DEFAULT ''"
+                ))
+            print(f"[db] added photo_path2 to {table}", flush=True)
+
+
 def init_db() -> None:
     Base.metadata.create_all(engine)
+    _ensure_columns()

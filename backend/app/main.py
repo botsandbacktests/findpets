@@ -15,12 +15,13 @@ from sqlalchemy.orm import Session
 from .config import (UPLOAD_DIR, DEFAULT_ALERT_THRESHOLD, SQUARE_PAYMENT_LINK, SITE_URL,
                      UNLOCK_PRICE_USD, UNLOCK_DAYS)
 from .storage import save_photo, photo_ref_to_url
-from .db import SessionLocal, User, Pet, Sighting, ContactUnlock, init_db
+from .db import SessionLocal, User, Pet, Sighting, ContactUnlock, MatchAlert, init_db
 from .embedder import get_embedder
 from .matching import find_matches
 from .auth import (hash_password, verify_password, make_token, read_token,
                    make_reset_token, read_reset_token)
 from .mailer import send_email, mail_configured
+from .alerts import send_owner_alert, send_finder_alert
 
 WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
 
@@ -85,6 +86,21 @@ def _save_upload(file: UploadFile) -> tuple[str, bytes]:
     # Returns a Cloudinary URL in production, or a bare filename locally.
     ref = save_photo(raw, ext)
     return ref, raw
+
+
+def _save_optional(file: "UploadFile | None") -> str:
+    """Save a second/optional photo if provided; return its ref or ''.
+
+    Some clients send an empty file part when no 2nd photo is chosen, so we
+    guard on both None and empty bytes.
+    """
+    if file is None or not getattr(file, "filename", ""):
+        return ""
+    try:
+        ref, _ = _save_upload(file)
+        return ref
+    except HTTPException:
+        return ""  # empty/invalid 2nd photo shouldn't fail the whole request
 
 
 def _has_active_unlock(db: Session, user_id: int, pet_id: int) -> ContactUnlock | None:
@@ -231,9 +247,11 @@ def report_lost_pet(
     alert_radius_km: float = Form(16.0), alert_threshold: float = Form(DEFAULT_ALERT_THRESHOLD),
     contact_name: str = Form(""), contact_email: str = Form(""), contact_phone: str = Form(""),
     photo: UploadFile = File(...),
+    photo2: UploadFile | None = File(None),
     user: User = Depends(require_user), db: Session = Depends(get_db),
 ):
     fname, raw = _save_upload(photo)
+    fname2 = _save_optional(photo2)
     emb = get_embedder()
     vec = emb.embed(raw)
     pet = Pet(
@@ -244,7 +262,8 @@ def report_lost_pet(
         alert_radius_km=alert_radius_km, alert_threshold=alert_threshold,
         contact_name=contact_name or user.display_name,
         contact_email=contact_email or user.email, contact_phone=contact_phone,
-        photo_path=fname, embedding=vec.astype(np.float32).tobytes(), embed_model=emb.name,
+        photo_path=fname, photo_path2=fname2,
+        embedding=vec.astype(np.float32).tobytes(), embed_model=emb.name,
     )
     db.add(pet); db.commit(); db.refresh(pet)
     return _pet_owner_view(pet)
@@ -267,30 +286,108 @@ def mark_found(pet_id: int, user: User = Depends(require_user), db: Session = De
     return {"id": pet.id, "status": pet.status}
 
 
+def _dispatch_match_alerts(
+    db: Session, matches: list[dict], sighting_id: int | None,
+    finder_email: str, sighting_photo_urls: list[str] | None = None,
+) -> None:
+    """Best-effort: email owners (and the finder) about qualifying matches.
+
+    - Emails a pet's owner when the match score >= that pet's alert_threshold.
+    - Emails the finder once if they provided a contact_email.
+    - Skips any (pet, sighting) pair already alerted (de-dup via MatchAlert).
+    - Never raises: a mail problem must not break the match response.
+    """
+    finder_email = (finder_email or "").strip().lower()
+    finder_notified = False
+    try:
+        for m in matches:
+            pet: Pet = m["pet"]
+            sim = m["similarity"]              # 0-1 cosine similarity
+            score_pct = m["score_pct"]
+            distance_km = m["distance_km"]
+
+            threshold = pet.alert_threshold or DEFAULT_ALERT_THRESHOLD
+            if sim < threshold:
+                continue  # not a strong enough match to bother the owner
+
+            # De-dup: have we already alerted for this pet + sighting?
+            already = None
+            if sighting_id is not None:
+                already = db.query(MatchAlert).filter(
+                    MatchAlert.pet_id == pet.id,
+                    MatchAlert.sighting_id == sighting_id,
+                ).first()
+            if already:
+                continue
+
+            owner_email = (pet.contact_email or "").strip()
+            if not owner_email and pet.owner_id:
+                owner = db.get(User, pet.owner_id)
+                owner_email = owner.email if owner else ""
+
+            owner_ok = send_owner_alert(
+                owner_email, pet.name, score_pct, distance_km, SITE_URL,
+                sighting_photo_urls=sighting_photo_urls,
+            ) if owner_email else False
+
+            finder_ok = False
+            if finder_email and not finder_notified:
+                finder_ok = send_finder_alert(finder_email, score_pct, SITE_URL)
+                finder_notified = finder_ok or finder_notified
+
+            db.add(MatchAlert(
+                pet_id=pet.id, sighting_id=sighting_id,
+                owner_emailed=1 if owner_ok else 0,
+                finder_emailed=1 if finder_ok else 0,
+                score_pct=score_pct,
+            ))
+        db.commit()
+    except Exception as e:  # pragma: no cover - defensive
+        print(f"[alerts] dispatch failed (non-fatal): {type(e).__name__}: {e}",
+              flush=True)
+        db.rollback()
+
+
 @app.post("/api/sightings/match")
 def report_sighting_and_match(
     lat: float = Form(...), lng: float = Form(...),
     search_radius_km: float = Form(16.0), species: str = Form(""),
     contact_name: str = Form(""), contact_email: str = Form(""), contact_phone: str = Form(""),
     save: bool = Form(True), photo: UploadFile = File(...),
+    photo2: UploadFile | None = File(None),
     user: User | None = Depends(current_user), db: Session = Depends(get_db),
 ):
     """Upload a spotted animal, embed it, return PRIVACY-GATED ranked matches."""
     fname, raw = _save_upload(photo)
+    fname2 = _save_optional(photo2)
     emb = get_embedder()
     vec = emb.embed(raw)
     matches = find_matches(db, query_vec=vec, query_model=emb.name,
                            lat=lat, lng=lng, radius_km=search_radius_km,
                            species=species or None, top_k=10)
+    sighting_id = None
     if save:
         s = Sighting(
             reporter_id=user.id if user else None,
             lat=lat, lng=lng, search_radius_km=search_radius_km,
             status="matched" if matches else "open",
             contact_name=contact_name, contact_email=contact_email, contact_phone=contact_phone,
-            photo_path=fname, embedding=vec.astype(np.float32).tobytes(), embed_model=emb.name,
+            photo_path=fname, photo_path2=fname2,
+            embedding=vec.astype(np.float32).tobytes(), embed_model=emb.name,
         )
         db.add(s); db.commit()
+        sighting_id = s.id
+
+    # Notify owners (and the finder) about qualifying matches. Best-effort:
+    # this must never break the response, so failures are swallowed inside.
+    if matches:
+        sighting_photo_urls = [
+            photo_ref_to_url(ref) for ref in (fname, fname2) if ref
+        ]
+        _dispatch_match_alerts(
+            db, matches, sighting_id, contact_email,
+            sighting_photo_urls=sighting_photo_urls,
+        )
 
     out = []
     for m in matches:
