@@ -1,58 +1,74 @@
-"""Tiny email sender using Gmail SMTP (standard library only).
+"""Tiny email sender using the Resend HTTP API (works on Render's free tier).
 
-Set two environment variables (same Gmail App Password you already use for
-your trading bot is fine):
+Render's free plan blocks outbound SMTP (ports 25/465/587), so we send over
+HTTPS (port 443) via Resend's REST API instead. Standard library only — no
+extra packages.
 
-    GMAIL_USER          e.g. botsandbacktests@gmail.com
-    GMAIL_APP_PASSWORD  the 16-char Google App Password (no spaces)
+Set these environment variables in Render:
 
-Optional:
-    MAIL_FROM_NAME      display name on the From line (default "FindMyPet")
+    RESEND_API_KEY   your Resend API key (starts with "re_")
+    MAIL_FROM        the verified sender, e.g. "FindMyPet <noreply@tech956.com>"
+                     To test immediately without verifying a domain, use:
+                     "FindMyPet <onboarding@resend.dev>"
 
-If the vars aren't set, send_email() returns False and logs a warning instead
-of crashing — so the app still runs (useful in local/dev).
+If RESEND_API_KEY isn't set, send_email() logs a warning and returns False
+so the app still runs.
 """
 from __future__ import annotations
 
 import os
-import smtplib
-import ssl
-from email.message import EmailMessage
+import json
+import urllib.request
+import urllib.error
 
-GMAIL_USER = os.environ.get("GMAIL_USER", "")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "").replace(" ", "")
-MAIL_FROM_NAME = os.environ.get("MAIL_FROM_NAME", "FindMyPet")
+RESEND_API_KEY = os.environ.get("RESEND_API_KEY", "").strip()
+# Default sender uses Resend's shared test domain so it works before you verify
+# tech956.com. Override MAIL_FROM once your domain is verified in Resend.
+MAIL_FROM = os.environ.get("MAIL_FROM", "FindMyPet <onboarding@resend.dev>")
+
+_RESEND_URL = "https://api.resend.com/emails"
 
 
 def mail_configured() -> bool:
-    return bool(GMAIL_USER and GMAIL_APP_PASSWORD)
+    return bool(RESEND_API_KEY)
 
 
 def send_email(to_addr: str, subject: str, text_body: str, html_body: str | None = None) -> bool:
-    """Send one email via Gmail SMTP. Returns True on success, False otherwise."""
+    """Send one email via the Resend HTTP API. Returns True on success."""
     print(f"[mailer] send_email() called → to={to_addr!r} "
-          f"user_set={bool(GMAIL_USER)} pass_set={bool(GMAIL_APP_PASSWORD)} "
-          f"pass_len={len(GMAIL_APP_PASSWORD)}", flush=True)
+          f"key_set={bool(RESEND_API_KEY)} from={MAIL_FROM!r}", flush=True)
     if not mail_configured():
-        print("[mailer] GMAIL_USER / GMAIL_APP_PASSWORD not set — skipping send.", flush=True)
+        print("[mailer] RESEND_API_KEY not set — skipping send.", flush=True)
         return False
 
-    msg = EmailMessage()
-    msg["Subject"] = subject
-    msg["From"] = f"{MAIL_FROM_NAME} <{GMAIL_USER}>"
-    msg["To"] = to_addr
-    msg.set_content(text_body)
+    payload = {
+        "from": MAIL_FROM,
+        "to": [to_addr],
+        "subject": subject,
+        "text": text_body,
+    }
     if html_body:
-        msg.add_alternative(html_body, subtype="html")
+        payload["html"] = html_body
 
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        _RESEND_URL,
+        data=data,
+        method="POST",
+        headers={
+            "Authorization": f"Bearer {RESEND_API_KEY}",
+            "Content-Type": "application/json",
+        },
+    )
     try:
-        ctx = ssl.create_default_context()
-        # Gmail: SSL on 465 (simplest), or STARTTLS on 587.
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465, context=ctx, timeout=20) as server:
-            server.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-            server.send_message(msg)
-        print(f"[mailer] SENT OK → {to_addr}", flush=True)
-        return True
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            body = resp.read().decode("utf-8", "replace")
+            print(f"[mailer] SENT OK → {to_addr} (HTTP {resp.status}) {body[:200]}", flush=True)
+            return True
+    except urllib.error.HTTPError as e:
+        detail = e.read().decode("utf-8", "replace")
+        print(f"[mailer] send FAILED: HTTP {e.code} {detail[:300]}", flush=True)
+        return False
     except Exception as e:
         print(f"[mailer] send FAILED: {type(e).__name__}: {e}", flush=True)
         return False
