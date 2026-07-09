@@ -14,7 +14,13 @@ UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 # folders (e.g. some cloud-mounted dirs) can raise "disk I/O error". If that
 # happens, set DATABASE_URL to a local path, e.g.:
 #   export DATABASE_URL="sqlite:////absolute/local/path/findmypet.db"
+#
+# In PRODUCTION set DATABASE_URL to a Render Postgres URL so data survives
+# redeploys. Render hands out URLs starting with "postgres://", but SQLAlchemy
+# needs the "postgresql://" scheme — we normalize that below.
 DATABASE_URL = os.environ.get("DATABASE_URL", f"sqlite:///{DB_PATH}")
+if DATABASE_URL.startswith("postgres://"):
+    DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 # Notify owner when a sighting scores at/above this (0-1) unless they set their own.
 DEFAULT_ALERT_THRESHOLD = 0.60
@@ -35,3 +41,9 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "dev-insecure-change-me")
 # Public URL of the front-end (used to build password-reset links in emails).
 # e.g. https://tech956.com/findpets  — no trailing slash.
 SITE_URL = os.environ.get("SITE_URL", "https://tech956.com/findpets").rstrip("/")
+
+# --- Photo storage (Cloudinary) ---
+# When CLOUDINARY_URL is set (in Render env), uploaded pet photos are stored on
+# Cloudinary and survive redeploys. If it's blank, we fall back to saving files
+# to the local UPLOAD_DIR (fine for local dev; wiped on Render's free disk).
+CLOUDINARY_URL = os.environ.get("CLOUDINARY_URL", "").strip()

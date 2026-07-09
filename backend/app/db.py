@@ -10,7 +10,9 @@ from sqlalchemy.orm import (DeclarativeBase, Mapped, mapped_column,
 from .config import DATABASE_URL
 
 connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
-engine = create_engine(DATABASE_URL, connect_args=connect_args)
+# pool_pre_ping recycles dead connections — important on Render, where a sleeping
+# free instance drops its Postgres connections. Harmless for SQLite.
+engine = create_engine(DATABASE_URL, connect_args=connect_args, pool_pre_ping=True)
 SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
 
 

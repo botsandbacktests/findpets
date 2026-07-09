@@ -14,6 +14,7 @@ from sqlalchemy.orm import Session
 
 from .config import (UPLOAD_DIR, DEFAULT_ALERT_THRESHOLD, SQUARE_PAYMENT_LINK, SITE_URL,
                      UNLOCK_PRICE_USD, UNLOCK_DAYS)
+from .storage import save_photo, photo_ref_to_url
 from .db import SessionLocal, User, Pet, Sighting, ContactUnlock, init_db
 from .embedder import get_embedder
 from .matching import find_matches
@@ -81,9 +82,9 @@ def _save_upload(file: UploadFile) -> tuple[str, bytes]:
     ext = Path(file.filename or "").suffix.lower() or ".jpg"
     if ext not in {".jpg", ".jpeg", ".png", ".webp"}:
         ext = ".jpg"
-    fname = f"{uuid.uuid4().hex}{ext}"
-    (UPLOAD_DIR / fname).write_bytes(raw)
-    return fname, raw
+    # Returns a Cloudinary URL in production, or a bare filename locally.
+    ref = save_photo(raw, ext)
+    return ref, raw
 
 
 def _has_active_unlock(db: Session, user_id: int, pet_id: int) -> ContactUnlock | None:
@@ -108,7 +109,7 @@ def _pet_match_view(pet: Pet, distance_km: float, score_pct: float) -> dict:
         "id": pet.id,
         "species": pet.species,          # coarse category only
         "size": pet.size,                # coarse category only
-        "photo_url": f"/photos/{pet.photo_path}" if pet.photo_path else None,
+        "photo_url": photo_ref_to_url(pet.photo_path),
         "distance_km": round(distance_km, 2),
         "score_pct": round(score_pct, 1),
         "last_seen_at": pet.last_seen_at.isoformat(),
@@ -120,7 +121,7 @@ def _pet_owner_view(pet: Pet) -> dict:
     return {
         "id": pet.id, "name": pet.name, "species": pet.species, "breed": pet.breed,
         "color": pet.color, "size": pet.size, "description": pet.description,
-        "status": pet.status, "photo_url": f"/photos/{pet.photo_path}" if pet.photo_path else None,
+        "status": pet.status, "photo_url": photo_ref_to_url(pet.photo_path),
         "last_seen_at": pet.last_seen_at.isoformat(),
     }
 
@@ -214,7 +215,11 @@ def reset_password(token: str = Form(...), new_password: str = Form(...),
 @app.get("/api/health")
 def health():
     emb = get_embedder()
+    from .storage import storage_backend
+    from .config import DATABASE_URL
+    db_kind = "postgres" if DATABASE_URL.startswith("postgresql") else "sqlite"
     return {"status": "ok", "embedder": emb.name, "dim": emb.dim,
+            "database": db_kind, "photo_storage": storage_backend(),
             "unlock_price_usd": UNLOCK_PRICE_USD, "unlock_days": UNLOCK_DAYS}
 
 
