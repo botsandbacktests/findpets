@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: findmypet-api
+    runtime: python
+    # Render runs from the repo root. This backend lives in /backend,
+    # so we cd into it for both build and start.
+    buildCommand: "pip install -r backend/requirements.txt"
+    startCommand: "cd backend && uvicorn app.main:app --host 0.0.0.0 --port $PORT"
+    plan: free
+    envVars:
+      - key: SECRET_KEY
+        sync: false          # set the real value in the Render dashboard
+      - key: SQUARE_PAYMENT_LINK
+        value: "https://square.link/u/xzvRGMYR"
+      # NOTE on the database:
+      # Render's free tier has an EPHEMERAL disk — files written at runtime
+      # (like a SQLite .db and uploaded photos) are WIPED on every redeploy
+      # and periodic restarts. For testing that's fine. Before real launch,
+      # attach a Render Persistent Disk (paid) or move to Render Postgres.
+      - key: DATABASE_URL
+        value: "sqlite:////tmp/findmypet.db"

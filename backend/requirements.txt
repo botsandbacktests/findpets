@@ -1,0 +1,14 @@
+fastapi==0.111.0
+uvicorn[standard]==0.30.1
+sqlalchemy==2.0.30
+pydantic==2.7.1
+python-multipart==0.0.9
+numpy==1.26.4
+Pillow==10.3.0
+# --- Needed on cPanel/Passenger (WSGI) to serve the FastAPI ASGI app.
+# --- Harmless everywhere else; keep it in.
+a2wsgi==1.10.10
+# --- Optional: enables REAL DINOv2 embeddings. If not installed, the app
+# --- automatically falls back to a lightweight built-in embedder.
+# torch==2.3.0
+# torchvision==0.18.0

@@ -1,0 +1,121 @@
+"""Database setup and ORM models."""
+from __future__ import annotations
+
+import datetime as dt
+from sqlalchemy import (create_engine, String, Integer, Float, DateTime,
+                        ForeignKey, LargeBinary, Text)
+from sqlalchemy.orm import (DeclarativeBase, Mapped, mapped_column,
+                            relationship, sessionmaker)
+
+from .config import DATABASE_URL
+
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+engine = create_engine(DATABASE_URL, connect_args=connect_args)
+SessionLocal = sessionmaker(bind=engine, autoflush=False, autocommit=False)
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+def _now() -> dt.datetime:
+    return dt.datetime.utcnow()
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    email: Mapped[str] = mapped_column(String(160), unique=True, index=True)
+    display_name: Mapped[str] = mapped_column(String(120), default="")
+    password_hash: Mapped[str] = mapped_column(String(255))
+    phone: Mapped[str] = mapped_column(String(40), default="")  # optional contact
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+
+
+class Pet(Base):
+    __tablename__ = "pets"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    name: Mapped[str] = mapped_column(String(120))
+    species: Mapped[str] = mapped_column(String(40))          # dog, cat, ...
+    breed: Mapped[str] = mapped_column(String(120), default="")
+    color: Mapped[str] = mapped_column(String(80), default="")
+    size: Mapped[str] = mapped_column(String(40), default="")
+    description: Mapped[str] = mapped_column(Text, default="")
+    status: Mapped[str] = mapped_column(String(20), default="lost")  # lost/found
+
+    last_seen_lat: Mapped[float] = mapped_column(Float)
+    last_seen_lng: Mapped[float] = mapped_column(Float)
+    last_seen_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+
+    alert_radius_km: Mapped[float] = mapped_column(Float, default=16.0)
+    alert_threshold: Mapped[float] = mapped_column(Float, default=0.60)
+
+    # Contact details — NEVER exposed in public/match responses; revealed only
+    # to a user with an active ContactUnlock for this pet.
+    contact_name: Mapped[str] = mapped_column(String(120), default="")
+    contact_email: Mapped[str] = mapped_column(String(160), default="")
+    contact_phone: Mapped[str] = mapped_column(String(40), default="")
+
+    photo_path: Mapped[str] = mapped_column(String(255), default="")
+    embedding: Mapped[bytes] = mapped_column(LargeBinary)   # np.float32 bytes
+    embed_model: Mapped[str] = mapped_column(String(60), default="")
+
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+
+
+class Sighting(Base):
+    __tablename__ = "sightings"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    reporter_id: Mapped[int | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+
+    note: Mapped[str] = mapped_column(Text, default="")
+    # Contact details of the finder — also gated behind an unlock.
+    contact_name: Mapped[str] = mapped_column(String(120), default="")
+    contact_email: Mapped[str] = mapped_column(String(160), default="")
+    contact_phone: Mapped[str] = mapped_column(String(40), default="")
+
+    lat: Mapped[float] = mapped_column(Float)
+    lng: Mapped[float] = mapped_column(Float)
+    search_radius_km: Mapped[float] = mapped_column(Float, default=16.0)
+    status: Mapped[str] = mapped_column(String(20), default="open")
+
+    photo_path: Mapped[str] = mapped_column(String(255), default="")
+    embedding: Mapped[bytes] = mapped_column(LargeBinary)
+    embed_model: Mapped[str] = mapped_column(String(60), default="")
+
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+
+
+class ContactUnlock(Base):
+    """A paid 30-day pass: user X may see contact info for pet Y until expires_at."""
+    __tablename__ = "contact_unlocks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    pet_id: Mapped[int] = mapped_column(ForeignKey("pets.id"), index=True)
+
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending/active
+    amount_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    tip_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    # Reference the user provides after paying (Square receipt # or checkout email).
+    payment_ref: Mapped[str] = mapped_column(String(200), default="")
+
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+    activated_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+
+    def is_active(self) -> bool:
+        return (
+            self.status == "active"
+            and self.expires_at is not None
+            and self.expires_at > _now()
+        )
+
+
+def init_db() -> None:
+    Base.metadata.create_all(engine)
