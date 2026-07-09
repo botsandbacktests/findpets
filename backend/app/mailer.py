@@ -58,6 +58,11 @@ def send_email(to_addr: str, subject: str, text_body: str, html_body: str | None
         headers={
             "Authorization": f"Bearer {RESEND_API_KEY}",
             "Content-Type": "application/json",
+            # Cloudflare (in front of Resend) blocks the default Python-urllib
+            # User-Agent with a 403 / error 1010. Send a normal UA so the
+            # request isn't treated as a bot.
+            "User-Agent": "FindMyPet/1.0 (+https://tech956.com/findpets)",
+            "Accept": "application/json",
         },
     )
     try:
@@ -67,7 +72,7 @@ def send_email(to_addr: str, subject: str, text_body: str, html_body: str | None
             return True
     except urllib.error.HTTPError as e:
         detail = e.read().decode("utf-8", "replace")
-        print(f"[mailer] send FAILED: HTTP {e.code} {detail[:300]}", flush=True)
+        print(f"[mailer] send FAILED: HTTP {e.code} {detail[:600]}", flush=True)
         return False
     except Exception as e:
         print(f"[mailer] send FAILED: {type(e).__name__}: {e}", flush=True)
