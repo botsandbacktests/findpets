@@ -23,7 +23,10 @@ if DATABASE_URL.startswith("postgres://"):
     DATABASE_URL = DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
 # Notify owner when a sighting scores at/above this (0-1) unless they set their own.
-DEFAULT_ALERT_THRESHOLD = 0.60
+# Set to 0.75 to match the frontend's "strong match" bar: CLIP scores run warm
+# (two dogs alone ~60%), so 0.60 emailed owners about weak cross-breed lookalikes.
+# 0.75 only alerts on genuinely likely matches, cutting false-alarm emails.
+DEFAULT_ALERT_THRESHOLD = 0.75
 # Max distance (km) considered when matching, unless overridden per-request.
 DEFAULT_RADIUS_KM = 10.0
 
