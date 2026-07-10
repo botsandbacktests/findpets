@@ -13,9 +13,11 @@ from fastapi.staticfiles import StaticFiles
 from sqlalchemy.orm import Session
 
 from .config import (UPLOAD_DIR, DEFAULT_ALERT_THRESHOLD, SQUARE_PAYMENT_LINK, SITE_URL,
-                     UNLOCK_PRICE_USD, UNLOCK_DAYS)
+                     UNLOCK_PRICE_USD, UNLOCK_DAYS, FINDER_UNLOCK_PRICE_USD,
+                     BUNDLE_MATCH_MIN_PCT)
 from .storage import save_photo, photo_ref_to_url
-from .db import SessionLocal, User, Pet, Sighting, ContactUnlock, MatchAlert, init_db
+from .db import (SessionLocal, User, Pet, Sighting, ContactUnlock, FinderUnlock,
+                 MatchAlert, init_db)
 from .embedder import get_embedder, embed_with_fallback
 from .matching import find_matches
 from .auth import (hash_password, verify_password, make_token, read_token,
@@ -111,6 +113,57 @@ def _has_active_unlock(db: Session, user_id: int, pet_id: int) -> ContactUnlock 
         if r.is_active():
             return r
     return None
+
+
+def _has_active_finder_unlock(db: Session, user_id: int, pet_id: int) -> FinderUnlock | None:
+    """Active PER-PET bundle pass for this owner+pet, or None."""
+    rows = db.query(FinderUnlock).filter(
+        FinderUnlock.user_id == user_id, FinderUnlock.pet_id == pet_id
+    ).all()
+    for r in rows:
+        if r.is_active():
+            return r
+    return None
+
+
+def _score_sighting_against_pet(pet: Pet, s: Sighting) -> tuple[float, float] | None:
+    """Return (similarity_pct, distance_km) for a sighting vs a pet, or None if
+    they can't be compared (different embed model) or the sighting is out of its
+    own search radius. Used by both the owner's sighting list and the contact gate
+    so the qualifying rule is identical in both places.
+    """
+    from .embedder import cosine_similarity
+    from .geo import haversine_km
+    if not s.embedding or s.embed_model != pet.embed_model:
+        return None
+    dist = haversine_km(pet.last_seen_lat, pet.last_seen_lng, s.lat, s.lng)
+    if dist > (s.search_radius_km or 16.0):
+        return None
+    pet_vec = np.frombuffer(pet.embedding, dtype=np.float32)
+    sim = cosine_similarity(pet_vec, np.frombuffer(s.embedding, dtype=np.float32))
+    return round(sim * 100, 1), round(dist, 2)
+
+
+def _sighting_gated_view(s: Sighting, pet_id: int, score_pct: float,
+                         distance_km: float, unlocked: bool) -> dict:
+    """PRIVACY-GATED view of a sighting shown to a pet's owner BEFORE payment.
+
+    Shows the spotted-animal photos (proof it might be their pet) + score +
+    distance, but NO finder contact info. Contact is revealed only via
+    /api/sightings/{id}/contact once the owner holds an active FinderUnlock
+    for the pet AND the sighting scores >= BUNDLE_MATCH_MIN_PCT.
+    """
+    return {
+        "sighting_id": s.id,
+        "matched_pet_id": pet_id,
+        "photo_url": photo_ref_to_url(s.photo_path),
+        "photo_url2": photo_ref_to_url(s.photo_path2) if s.photo_path2 else "",
+        "score_pct": round(score_pct, 1),
+        "distance_km": round(distance_km, 2),
+        "seen_at": s.created_at.isoformat(),
+        "has_finder_contact": bool(s.contact_email or s.contact_phone or s.contact_name),
+        "finder_unlocked": unlocked,
+    }
 
 
 def _pet_match_view(pet: Pet, distance_km: float, score_pct: float) -> dict:
@@ -236,7 +289,8 @@ def health():
     db_kind = "postgres" if DATABASE_URL.startswith("postgresql") else "sqlite"
     return {"status": "ok", "embedder": emb.name, "dim": emb.dim,
             "database": db_kind, "photo_storage": storage_backend(),
-            "unlock_price_usd": UNLOCK_PRICE_USD, "unlock_days": UNLOCK_DAYS}
+            "unlock_price_usd": UNLOCK_PRICE_USD, "unlock_days": UNLOCK_DAYS,
+            "finder_unlock_price_usd": FINDER_UNLOCK_PRICE_USD}
 
 
 @app.post("/api/pets")
@@ -467,5 +521,137 @@ def get_contact(pet_id: int, user: User = Depends(require_user), db: Session = D
         "contact_name": pet.contact_name,
         "contact_email": pet.contact_email,
         "contact_phone": pet.contact_phone,
+        "pass_expires_at": unlock.expires_at.isoformat(),
+    }
+
+
+# --------------------------------------------- owner-pays-to-see-finder unlock flow
+# This is a PER-PET BUNDLE: the owner pays FINDER_UNLOCK_PRICE_USD ($24.99) once
+# for a pet and that unlocks the finder contact on EVERY sighting that scores
+# >= BUNDLE_MATCH_MIN_PCT (65% = green + orange) against that pet, for 30 days,
+# including new qualifying sightings that arrive during the window.
+@app.get("/api/pets/{pet_id}/sightings")
+def sightings_for_my_pet(pet_id: int, user: User = Depends(require_user),
+                         db: Session = Depends(get_db)):
+    """List sightings that MATCH one of my lost pets, so I (the owner) can see who
+    spotted my pet and pay once to reveal ALL their finder contacts.
+
+    Only the pet's own owner may call this. Returns privacy-gated views (photos +
+    score + distance, no contact). If I hold an active per-pet pass, every
+    qualifying (>=65%) sighting is marked unlocked.
+    """
+    pet = db.get(Pet, pet_id)
+    if not pet:
+        raise HTTPException(404, "Pet not found")
+    if pet.owner_id != user.id:
+        raise HTTPException(403, "You can only view sightings for your own pet.")
+
+    has_pass = bool(_has_active_finder_unlock(db, user.id, pet.id))
+    sightings = db.query(Sighting).order_by(Sighting.created_at.desc()).all()
+    out = []
+    for s in sightings:
+        scored = _score_sighting_against_pet(pet, s)
+        if scored is None:
+            continue
+        score_pct, dist = scored
+        if score_pct < 50:
+            continue  # hide clearly-irrelevant matches from the list entirely
+        qualifies = score_pct >= BUNDLE_MATCH_MIN_PCT  # covered by the bundle?
+        unlocked = has_pass and qualifies
+        view = _sighting_gated_view(s, pet.id, score_pct, dist, unlocked)
+        view["qualifies_for_bundle"] = qualifies
+        out.append(view)
+
+    out.sort(key=lambda r: r["score_pct"], reverse=True)
+    return {
+        "pet_id": pet.id,
+        "match_count": len(out),
+        "qualifying_count": sum(1 for v in out if v["qualifies_for_bundle"]),
+        "finder_unlock_price_usd": FINDER_UNLOCK_PRICE_USD,
+        "bundle_min_pct": BUNDLE_MATCH_MIN_PCT,
+        "has_pass": has_pass,
+        "sightings": out,
+    }
+
+
+@app.post("/api/finder-unlock/start")
+def finder_unlock_start(pet_id: int = Form(...),
+                        user: User = Depends(require_user), db: Session = Depends(get_db)):
+    """Begin a per-pet owner->finder bundle unlock. Returns the Square link."""
+    pet = db.get(Pet, pet_id)
+    if not pet:
+        raise HTTPException(404, "Pet not found")
+    if pet.owner_id != user.id:
+        raise HTTPException(403, "You can only unlock finders for your own pet.")
+    existing = _has_active_finder_unlock(db, user.id, pet_id)
+    if existing:
+        return {"already_active": True, "expires_at": existing.expires_at.isoformat()}
+    u = FinderUnlock(user_id=user.id, pet_id=pet_id, status="pending",
+                     amount_usd=FINDER_UNLOCK_PRICE_USD)
+    db.add(u); db.commit(); db.refresh(u)
+    return {
+        "unlock_id": u.id,
+        "payment_link": SQUARE_PAYMENT_LINK,
+        "price_usd": FINDER_UNLOCK_PRICE_USD,
+        "instructions": ("Complete payment on the Square page, then return here and "
+                         "confirm using the email or receipt number from your Square receipt."),
+    }
+
+
+@app.post("/api/finder-unlock/confirm")
+def finder_unlock_confirm(unlock_id: int = Form(...), payment_ref: str = Form(...),
+                          tip_usd: float = Form(0.0),
+                          user: User = Depends(require_user), db: Session = Depends(get_db)):
+    """Confirm payment and activate the 30-day per-pet finder-contact pass.
+
+    Same manual-confirm caveat as /api/unlock/confirm: a basic Square link can't
+    be verified server-side, so this records the reference and activates the pass.
+    Replaced by a Square webhook when deployed. (See README.)
+    """
+    u = db.get(FinderUnlock, unlock_id)
+    if not u or u.user_id != user.id:
+        raise HTTPException(404, "Unlock not found")
+    if u.is_active():
+        return {"status": "active", "expires_at": u.expires_at.isoformat()}
+    now = dt.datetime.utcnow()
+    u.status = "active"
+    u.payment_ref = payment_ref
+    u.tip_usd = max(0.0, tip_usd)
+    u.activated_at = now
+    u.expires_at = now + dt.timedelta(days=UNLOCK_DAYS)
+    db.commit()
+    return {"status": "active", "expires_at": u.expires_at.isoformat()}
+
+
+@app.get("/api/sightings/{sighting_id}/contact")
+def get_finder_contact(sighting_id: int, pet_id: int,
+                       user: User = Depends(require_user), db: Session = Depends(get_db)):
+    """Return a finder's contact info ONLY if the user holds an active per-pet
+    bundle pass for `pet_id` AND this sighting scores >= BUNDLE_MATCH_MIN_PCT (65%)
+    against that pet. The pet must be the caller's own pet.
+    """
+    s = db.get(Sighting, sighting_id)
+    if not s:
+        raise HTTPException(404, "Sighting not found")
+    pet = db.get(Pet, pet_id)
+    if not pet or pet.owner_id != user.id:
+        raise HTTPException(403, "You can only view finders for your own pet.")
+
+    unlock = _has_active_finder_unlock(db, user.id, pet_id)
+    if not unlock:
+        raise HTTPException(402, "Payment required to view finder contact info.")
+
+    scored = _score_sighting_against_pet(pet, s)
+    if scored is None or scored[0] < BUNDLE_MATCH_MIN_PCT:
+        # Pass is valid but this particular sighting isn't a strong enough match
+        # to be part of the bundle.
+        raise HTTPException(403, "This sighting isn't a strong enough match to unlock.")
+
+    return {
+        "sighting_id": s.id,
+        "contact_name": s.contact_name,
+        "contact_email": s.contact_email,
+        "contact_phone": s.contact_phone,
+        "note": s.note,
         "pass_expires_at": unlock.expires_at.isoformat(),
     }

@@ -35,8 +35,20 @@ DEFAULT_RADIUS_KM = 10.0
 SQUARE_PAYMENT_LINK = os.environ.get(
     "SQUARE_PAYMENT_LINK", "https://square.link/u/xzvRGMYR"
 )
-UNLOCK_PRICE_USD = 9.99
+UNLOCK_PRICE_USD = 9.99  # finder pays to see the pet OWNER's contact info
 UNLOCK_DAYS = 30  # a paid unlock grants contact access for this many days (per pet)
+
+# Owner pays to see the FINDER's contact info (people who reported sightings of
+# their lost pet). This is a PER-PET BUNDLE: one payment unlocks the finder
+# contact for EVERY qualifying sighting on that pet for UNLOCK_DAYS (30) days,
+# including new qualifying sightings that arrive during the window.
+FINDER_UNLOCK_PRICE_USD = float(os.environ.get("FINDER_UNLOCK_PRICE_USD", 24.99))
+
+# A sighting qualifies for the bundle (and is shown to the owner) when it scores
+# at/above this % against the pet. 65 = the app's "possible match" (orange) bar,
+# so the $24.99 unlocks all green (80%+) AND orange (65-80%) matches. Weaker
+# matches (<65%) stay hidden and locked. Keep in sync with app.html scoreClass().
+BUNDLE_MATCH_MIN_PCT = 65.0
 
 # Secret used to sign login/session tokens. Override in production via env var.
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-insecure-change-me")

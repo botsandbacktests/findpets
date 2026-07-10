@@ -121,6 +121,37 @@ class ContactUnlock(Base):
         )
 
 
+class FinderUnlock(Base):
+    """A paid 30-day PER-PET bundle in the OTHER direction: pet-owner X may see the
+    finder contact for EVERY qualifying sighting of pet Y until expires_at.
+
+    One payment ($24.99) unlocks all green+orange (>=65%) matches on that pet for
+    30 days, including new qualifying sightings that arrive during the window.
+    Keyed on pet_id (not sighting_id) so it covers many sightings at once.
+    """
+    __tablename__ = "finder_unlocks"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
+    pet_id: Mapped[int] = mapped_column(ForeignKey("pets.id"), index=True)
+
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending/active
+    amount_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    tip_usd: Mapped[float] = mapped_column(Float, default=0.0)
+    payment_ref: Mapped[str] = mapped_column(String(200), default="")
+
+    created_at: Mapped[dt.datetime] = mapped_column(DateTime, default=_now)
+    activated_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+    expires_at: Mapped[dt.datetime | None] = mapped_column(DateTime, nullable=True)
+
+    def is_active(self) -> bool:
+        return (
+            self.status == "active"
+            and self.expires_at is not None
+            and self.expires_at > _now()
+        )
+
+
 class MatchAlert(Base):
     """Record that we emailed an alert for a given pet+sighting match.
 
