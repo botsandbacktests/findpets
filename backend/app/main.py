@@ -6,7 +6,8 @@ import datetime as dt
 from pathlib import Path
 
 import numpy as np
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Header
+from fastapi import (FastAPI, UploadFile, File, Form, HTTPException, Depends,
+                     Header, Request)
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -14,7 +15,7 @@ from sqlalchemy.orm import Session
 
 from .config import (UPLOAD_DIR, DEFAULT_ALERT_THRESHOLD, SQUARE_PAYMENT_LINK, SITE_URL,
                      UNLOCK_PRICE_USD, UNLOCK_DAYS, FINDER_UNLOCK_PRICE_USD,
-                     BUNDLE_MATCH_MIN_PCT)
+                     BUNDLE_MATCH_MIN_PCT, square_api_configured)
 from .storage import save_photo, photo_ref_to_url
 from .db import (SessionLocal, User, Pet, Sighting, ContactUnlock, FinderUnlock,
                  MatchAlert, init_db)
@@ -24,6 +25,7 @@ from .auth import (hash_password, verify_password, make_token, read_token,
                    make_reset_token, read_reset_token)
 from .mailer import send_email, mail_configured
 from .alerts import send_owner_alert, send_finder_alert
+from . import square_client as sq
 
 WEB_DIR = Path(__file__).resolve().parent.parent.parent / "web"
 
@@ -290,7 +292,9 @@ def health():
     return {"status": "ok", "embedder": emb.name, "dim": emb.dim,
             "database": db_kind, "photo_storage": storage_backend(),
             "unlock_price_usd": UNLOCK_PRICE_USD, "unlock_days": UNLOCK_DAYS,
-            "finder_unlock_price_usd": FINDER_UNLOCK_PRICE_USD}
+            "finder_unlock_price_usd": FINDER_UNLOCK_PRICE_USD,
+            # "auto" = unique links + webhook verification; "manual" = static link
+            "payment_verify": "auto" if square_api_configured() else "manual"}
 
 
 @app.post("/api/pets")
@@ -454,10 +458,29 @@ def report_sighting_and_match(
 
 
 # ---------------------------------------------------------------- unlock flow
+def _checkout_for(kind: str, unlock_id: int, amount_usd: float, name: str) -> dict:
+    """Return the payment link + how it was verified.
+
+    When the Square API is configured, mint a UNIQUE hosted checkout carrying our
+    unlock ref so the webhook can auto-verify. Otherwise fall back to the static
+    link + manual receipt entry. Never raises — a Square hiccup just degrades to
+    the static link so the user can still pay.
+    """
+    if square_api_configured():
+        try:
+            link = sq.create_payment_link(kind, unlock_id, amount_usd, name)
+            if link.get("url"):
+                return {"payment_link": link["url"], "verify": "auto",
+                        "payment_link_id": link.get("payment_link_id", "")}
+        except sq.SquareError as e:
+            print(f"[square] create link failed, using static link: {e}", flush=True)
+    return {"payment_link": SQUARE_PAYMENT_LINK, "verify": "manual"}
+
+
 @app.post("/api/unlock/start")
 def unlock_start(pet_id: int = Form(...),
                  user: User = Depends(require_user), db: Session = Depends(get_db)):
-    """Begin an unlock. Returns the Square payment link to send the user to."""
+    """Begin a finder->owner unlock. Returns a (unique when possible) Square link."""
     pet = db.get(Pet, pet_id)
     if not pet:
         raise HTTPException(404, "Pet not found")
@@ -467,12 +490,16 @@ def unlock_start(pet_id: int = Form(...),
     u = ContactUnlock(user_id=user.id, pet_id=pet_id, status="pending",
                       amount_usd=UNLOCK_PRICE_USD)
     db.add(u); db.commit(); db.refresh(u)
+    checkout = _checkout_for("pet", u.id, UNLOCK_PRICE_USD,
+                             f"FindMyPet — unlock owner contact")
     return {
         "unlock_id": u.id,
-        "payment_link": SQUARE_PAYMENT_LINK,
+        "kind": "pet",
+        "payment_link": checkout["payment_link"],
+        "verify": checkout["verify"],   # "auto" = webhook; "manual" = type receipt
         "price_usd": UNLOCK_PRICE_USD,
-        "instructions": ("Complete payment on the Square page, then return here and "
-                         "confirm using the email or receipt number from your Square receipt."),
+        "instructions": ("Complete payment on the Square page. We'll confirm it "
+                         "automatically and unlock the contact."),
     }
 
 
@@ -589,12 +616,16 @@ def finder_unlock_start(pet_id: int = Form(...),
     u = FinderUnlock(user_id=user.id, pet_id=pet_id, status="pending",
                      amount_usd=FINDER_UNLOCK_PRICE_USD)
     db.add(u); db.commit(); db.refresh(u)
+    checkout = _checkout_for("finder", u.id, FINDER_UNLOCK_PRICE_USD,
+                             f"FindMyPet — unlock finder contacts")
     return {
         "unlock_id": u.id,
-        "payment_link": SQUARE_PAYMENT_LINK,
+        "kind": "finder",
+        "payment_link": checkout["payment_link"],
+        "verify": checkout["verify"],
         "price_usd": FINDER_UNLOCK_PRICE_USD,
-        "instructions": ("Complete payment on the Square page, then return here and "
-                         "confirm using the email or receipt number from your Square receipt."),
+        "instructions": ("Complete payment on the Square page. We'll confirm it "
+                         "automatically and unlock the finder contacts."),
     }
 
 
@@ -654,4 +685,102 @@ def get_finder_contact(sighting_id: int, pet_id: int,
         "contact_phone": s.contact_phone,
         "note": s.note,
         "pass_expires_at": unlock.expires_at.isoformat(),
+    }
+
+
+# ------------------------------------------------ Square webhook + payment status
+def _activate_unlock(db: Session, kind: str, unlock_id: int, payment_ref: str,
+                     tip_usd: float = 0.0) -> bool:
+    """Activate a ContactUnlock ('pet') or FinderUnlock ('finder') by id.
+
+    Idempotent: re-running on an already-active pass is a no-op that returns True,
+    so a re-delivered webhook can't double-charge time or error out. Returns True
+    if the unlock exists and is now active.
+    """
+    Model = ContactUnlock if kind == "pet" else FinderUnlock
+    u = db.get(Model, unlock_id)
+    if not u:
+        return False
+    if u.is_active():
+        return True
+    now = dt.datetime.utcnow()
+    u.status = "active"
+    u.payment_ref = payment_ref or u.payment_ref
+    u.tip_usd = max(0.0, float(tip_usd or 0.0))
+    u.activated_at = now
+    u.expires_at = now + dt.timedelta(days=UNLOCK_DAYS)
+    db.commit()
+    return True
+
+
+@app.post("/api/square/webhook")
+async def square_webhook(request: Request, db: Session = Depends(get_db)):
+    """Receive Square payment notifications and auto-activate the matching unlock.
+
+    Security: verifies the x-square-hmacsha256-signature over (notification_url +
+    raw body) using our webhook signature key. Unverified calls are rejected.
+
+    Matching: we stamped 'pet:<id>' or 'finder:<id>' into the payment_note when
+    creating the checkout, so the payment object in the webhook carries it back.
+    Only COMPLETED payments activate an unlock.
+    """
+    raw = await request.body()
+    sig = request.headers.get("x-square-hmacsha256-signature", "")
+    if not sq.verify_webhook_signature(raw, sig):
+        raise HTTPException(401, "Invalid webhook signature")
+
+    try:
+        event = __import__("json").loads(raw.decode("utf-8"))
+    except Exception:
+        raise HTTPException(400, "Bad JSON")
+
+    # Dig out the payment object (shape: data.object.payment).
+    payment = (((event.get("data") or {}).get("object") or {}).get("payment")) or {}
+    status = (payment.get("status") or "").upper()
+    note = payment.get("note") or ""
+    order_id = payment.get("order_id") or ""
+    payment_id = payment.get("id") or ""
+
+    # Recover our unlock ref: prefer the payment note; fall back to the order's
+    # reference_id if a note wasn't carried through.
+    ref = sq.parse_ref(note)
+    if ref is None and order_id:
+        ref = sq.parse_ref(sq.get_order_reference(order_id))
+
+    # Acknowledge (200) even when we can't act, so Square stops retrying a payment
+    # that isn't ours or isn't finished. We just don't activate anything.
+    if status not in ("COMPLETED", "APPROVED", "CAPTURED"):
+        return {"ok": True, "ignored": f"status={status or 'unknown'}"}
+    if ref is None:
+        return {"ok": True, "ignored": "no matching unlock ref"}
+
+    kind, unlock_id = ref
+    ok = _activate_unlock(db, kind, unlock_id, payment_ref=payment_id)
+    return {"ok": True, "activated": ok, "kind": kind, "unlock_id": unlock_id}
+
+
+@app.get("/api/unlock/status")
+def unlock_status(kind: str, unlock_id: int,
+                  user: User = Depends(require_user), db: Session = Depends(get_db)):
+    """Let the frontend poll whether a pending unlock has been activated yet.
+
+    Used after the buyer returns from Square: the page polls this until the
+    webhook flips the unlock to active, then reveals the contact. Only the owner
+    of the unlock can read its status.
+    """
+    if kind not in ("pet", "finder"):
+        raise HTTPException(400, "Bad kind")
+    Model = ContactUnlock if kind == "pet" else FinderUnlock
+    u = db.get(Model, unlock_id)
+    if not u or u.user_id != user.id:
+        raise HTTPException(404, "Unlock not found")
+    active = u.is_active()
+    return {
+        "kind": kind,
+        "unlock_id": u.id,
+        "status": "active" if active else u.status,
+        "active": active,
+        "expires_at": u.expires_at.isoformat() if u.expires_at else None,
+        # echo the target id so the frontend knows what to reveal
+        "target_id": getattr(u, "pet_id", None),
     }

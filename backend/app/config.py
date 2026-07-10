@@ -31,10 +31,38 @@ DEFAULT_ALERT_THRESHOLD = 0.75
 DEFAULT_RADIUS_KM = 10.0
 
 # --- Payments / contact unlock ---
-# Your Square hosted payment link (public — safe to keep here).
+# Fallback static Square hosted payment link, used ONLY when the Square API isn't
+# configured (below). Once the API creds are set, each unlock gets its OWN unique
+# checkout link so the webhook can match the payment back to the exact unlock.
 SQUARE_PAYMENT_LINK = os.environ.get(
     "SQUARE_PAYMENT_LINK", "https://square.link/u/xzvRGMYR"
 )
+
+# --- Square API (unique checkout links + webhook auto-verification) ---
+# All read from Render env vars; blank locally so the app falls back to the
+# static link + manual receipt entry. Get these from the Square Developer
+# Dashboard (see SETUP-square-payments.md).
+SQUARE_ACCESS_TOKEN = os.environ.get("SQUARE_ACCESS_TOKEN", "").strip()
+SQUARE_LOCATION_ID = os.environ.get("SQUARE_LOCATION_ID", "").strip()
+SQUARE_WEBHOOK_SIGNATURE_KEY = os.environ.get("SQUARE_WEBHOOK_SIGNATURE_KEY", "").strip()
+# "sandbox" (test cards, no real money) or "production" (real charges).
+SQUARE_ENV = os.environ.get("SQUARE_ENV", "sandbox").strip().lower()
+# Public URL Square calls with payment notifications. Must EXACTLY match the URL
+# entered in the Square webhook subscription (used in signature verification).
+SQUARE_WEBHOOK_URL = os.environ.get(
+    "SQUARE_WEBHOOK_URL",
+    "https://findmypet-api-9pez.onrender.com/api/square/webhook",
+).strip()
+
+def square_api_configured() -> bool:
+    """True when we have enough to create checkout links via the Square API."""
+    return bool(SQUARE_ACCESS_TOKEN and SQUARE_LOCATION_ID)
+
+def square_api_base() -> str:
+    return ("https://connect.squareupsandbox.com"
+            if SQUARE_ENV != "production"
+            else "https://connect.squareup.com")
+
 UNLOCK_PRICE_USD = 9.99  # finder pays to see the pet OWNER's contact info
 UNLOCK_DAYS = 30  # a paid unlock grants contact access for this many days (per pet)
 
@@ -56,6 +84,10 @@ SECRET_KEY = os.environ.get("SECRET_KEY", "dev-insecure-change-me")
 # Public URL of the front-end (used to build password-reset links in emails).
 # e.g. https://tech956.com/findpets  — no trailing slash.
 SITE_URL = os.environ.get("SITE_URL", "https://tech956.com/findpets").rstrip("/")
+
+# Where Square sends the buyer AFTER paying — back to the app so it can poll for
+# the webhook to confirm. Defaults to the app page with a ?paid=1 flag.
+SQUARE_REDIRECT_URL = os.environ.get("SQUARE_REDIRECT_URL", f"{SITE_URL}/app.html?paid=1")
 
 # --- Photo storage (Cloudinary) ---
 # When CLOUDINARY_URL is set (in Render env), uploaded pet photos are stored on
