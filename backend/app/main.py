@@ -395,7 +395,7 @@ def report_sighting_and_match(
         view["contact_unlocked"] = bool(user and _has_active_unlock(db, user.id, pet.id))
         out.append(view)
 
-    return {"embedder": emb.name, "match_count": len(out),
+    return {"embedder": model_name, "match_count": len(out),
             "unlock_price_usd": UNLOCK_PRICE_USD, "matches": out}
 
 
