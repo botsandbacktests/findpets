@@ -16,7 +16,7 @@ from .config import (UPLOAD_DIR, DEFAULT_ALERT_THRESHOLD, SQUARE_PAYMENT_LINK, S
                      UNLOCK_PRICE_USD, UNLOCK_DAYS)
 from .storage import save_photo, photo_ref_to_url
 from .db import SessionLocal, User, Pet, Sighting, ContactUnlock, MatchAlert, init_db
-from .embedder import get_embedder
+from .embedder import get_embedder, embed_with_fallback
 from .matching import find_matches
 from .auth import (hash_password, verify_password, make_token, read_token,
                    make_reset_token, read_reset_token)
@@ -252,8 +252,7 @@ def report_lost_pet(
 ):
     fname, raw = _save_upload(photo)
     fname2 = _save_optional(photo2)
-    emb = get_embedder()
-    vec = emb.embed(raw)
+    vec, model_name = embed_with_fallback(raw)
     pet = Pet(
         owner_id=user.id, name=name, species=species, breed=breed, color=color,
         size=size, description=description, status="lost",
@@ -263,7 +262,7 @@ def report_lost_pet(
         contact_name=contact_name or user.display_name,
         contact_email=contact_email or user.email, contact_phone=contact_phone,
         photo_path=fname, photo_path2=fname2,
-        embedding=vec.astype(np.float32).tobytes(), embed_model=emb.name,
+        embedding=vec.astype(np.float32).tobytes(), embed_model=model_name,
     )
     db.add(pet); db.commit(); db.refresh(pet)
     return _pet_owner_view(pet)
@@ -360,9 +359,8 @@ def report_sighting_and_match(
     """Upload a spotted animal, embed it, return PRIVACY-GATED ranked matches."""
     fname, raw = _save_upload(photo)
     fname2 = _save_optional(photo2)
-    emb = get_embedder()
-    vec = emb.embed(raw)
-    matches = find_matches(db, query_vec=vec, query_model=emb.name,
+    vec, model_name = embed_with_fallback(raw)
+    matches = find_matches(db, query_vec=vec, query_model=model_name,
                            lat=lat, lng=lng, radius_km=search_radius_km,
                            species=species or None, top_k=10)
     sighting_id = None
@@ -373,7 +371,7 @@ def report_sighting_and_match(
             status="matched" if matches else "open",
             contact_name=contact_name, contact_email=contact_email, contact_phone=contact_phone,
             photo_path=fname, photo_path2=fname2,
-            embedding=vec.astype(np.float32).tobytes(), embed_model=emb.name,
+            embedding=vec.astype(np.float32).tobytes(), embed_model=model_name,
         )
         db.add(s); db.commit()
         sighting_id = s.id

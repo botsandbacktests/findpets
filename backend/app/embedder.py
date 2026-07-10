@@ -234,8 +234,41 @@ def get_embedder() -> BaseEmbedder:
     return _EMBEDDER
 
 
+_FALLBACK_EMBEDDER: FallbackEmbedder | None = None
+
+
+def embed_with_fallback(image_bytes: bytes) -> tuple[np.ndarray, str]:
+    """
+    Embed an image, degrading gracefully instead of crashing.
+
+    Tries the preferred embedder (hosted CLIP / DINOv2). If it raises for ANY
+    reason — e.g. Replicate returns HTTP 402 Payment Required, a network blip,
+    or a timeout — we fall back to the always-available FallbackEmbedder so the
+    user's action (posting a lost pet, reporting a sighting) still succeeds.
+
+    Returns (vector, model_name). The model_name tells the caller which backend
+    actually produced the vector, so it gets stored on the row and matching only
+    ever compares vectors from the same backend.
+    """
+    global _FALLBACK_EMBEDDER
+    emb = get_embedder()
+    try:
+        return emb.embed(image_bytes), emb.name
+    except Exception as e:
+        # If the primary WAS already the fallback, there's nothing better to try.
+        if isinstance(emb, FallbackEmbedder):
+            raise
+        print(f"[embedder] primary '{emb.name}' failed "
+              f"({type(e).__name__}: {e}); using fallback for this image",
+              flush=True)
+        if _FALLBACK_EMBEDDER is None:
+            _FALLBACK_EMBEDDER = FallbackEmbedder()
+        return _FALLBACK_EMBEDDER.embed(image_bytes), _FALLBACK_EMBEDDER.name
+
+
 def cosine_similarity(a: np.ndarray, b: np.ndarray) -> float:
     """Cosine similarity for already-L2-normalized vectors of the same backend."""
     if a.shape != b.shape:
         return 0.0
     return float(np.clip(np.dot(a, b), -1.0, 1.0))
+# end of embedder module
