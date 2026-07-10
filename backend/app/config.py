@@ -47,3 +47,12 @@ SITE_URL = os.environ.get("SITE_URL", "https://tech956.com/findpets").rstrip("/"
 # Cloudinary and survive redeploys. If it's blank, we fall back to saving files
 # to the local UPLOAD_DIR (fine for local dev; wiped on Render's free disk).
 CLOUDINARY_URL = os.environ.get("CLOUDINARY_URL", "").strip()
+
+# --- Real AI matching (hosted CLIP embeddings via Replicate) ---
+# When REPLICATE_API_TOKEN is set (in Render env), the app sends each pet photo
+# to Replicate's hosted CLIP model and gets back a real 768-dim feature vector —
+# actual visual matching, running fine on Render's free 512MB tier.
+# If it's blank, embedder.py falls back to local DINOv2 (needs torch) or, last
+# resort, the weak color/texture descriptor. Read directly from the environment
+# in embedder.py; surfaced here so all config lives in one place.
+REPLICATE_API_TOKEN = os.environ.get("REPLICATE_API_TOKEN", "").strip()
